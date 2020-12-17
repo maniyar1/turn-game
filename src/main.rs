@@ -1,13 +1,19 @@
+use std::collections::HashMap;
 use std::io::prelude::*;
 use std::io::{self, Read};
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::str;
 use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+use serde::{Serialize, Deserialize};
+use serde::ser::{Serializer, SerializeStruct};
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 enum Team {
     Red,
     Black,
@@ -16,20 +22,68 @@ enum Team {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Action {
     Attack,
-    Defend,
+    Heal,
 }
 
+#[derive(Debug, Clone)]
 struct Player {
     id: u8,
-    stream: TcpStream,
+    name: String,
+    stream: Arc<Mutex<TcpStream>>,
     ready: bool,
     team: Team,
     health: i8,
 }
-fn main() -> std::io::Result<()> {
-    let mut team_black = Vec::<Player>::new();
-    let mut team_red = Vec::<Player>::new();
-    let listener = TcpListener::bind("127.0.0.1:1370")?;
+
+impl Serialize for Player { // Can't serialize TCPStream so it's custom serializer time
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Player", 5)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("ready", &self.ready)?;
+        state.serialize_field("team", &self.team)?;
+        state.serialize_field("health", &self.health)?;
+        state.end()
+    }
+}
+
+#[derive(Serialize, Debug, Clone)]
+struct GameState {
+    team_red: HashMap<String, Player>,
+    team_black: HashMap<String, Player>,
+    current_turn: Team,
+}
+
+fn main() {
+    let mut game = GameState {
+        team_red: HashMap::<String, Player>::new(),
+        team_black: HashMap::<String, Player>::new(),
+        current_turn: Team::Black,
+    };
+    setup(&mut game);
+    loop {
+        if game.current_turn == Team::Black {
+            let (black, red) = team_turn(game.team_black, game.team_red);
+            game.team_black = black;
+            game.team_red = red;
+            game.current_turn = Team::Red;
+        } else {
+            let (red, black) = team_turn(game.team_red, game.team_black);
+            game.team_red = red;
+            game.team_black = black;
+            game.current_turn = Team::Black;
+        }
+        println!("updating..");
+        update(&game);
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+fn setup(game: &mut GameState) {
+    let listener = TcpListener::bind("127.0.0.1:1370").unwrap();
     let mut ready = false;
     let (tx, rx) = mpsc::channel();
     let mut ready_check = Vec::new();
@@ -42,6 +96,7 @@ fn main() -> std::io::Result<()> {
                 ready_check.push(false);
                 let id = ready_check.len() - 1;
                 let tx_clone = tx.clone();
+                conn.0.set_nodelay(true).unwrap();
                 thread::spawn(move || {
                     single_connection(conn.0, tx_clone, id as u8);
                 });
@@ -51,126 +106,85 @@ fn main() -> std::io::Result<()> {
         }
         for receiver in rx.try_iter() {
             ready_check[receiver.id as usize] = receiver.ready;
-            if receiver.team == Team::Black {
-                team_black.push(receiver);
-            } else {
-                team_red.push(receiver);
+            if receiver.ready {
+                if receiver.team == Team::Black {
+                    game.team_black.insert(receiver.name.clone(), receiver);
+                } else if receiver.team == Team::Red {
+                    game.team_red.insert(receiver.name.clone(), receiver);
+                }
             }
         }
         ready = !ready_check.contains(&false) && !ready_check.is_empty();
     }
-    let black_length = team_black.len();
-    let red_length = team_red.len();
-    let (tx_action, rx_action) = mpsc::channel();
-    let current_turn = Team::Black;
-    loop {
-        for player in &mut team_red {
-            player.stream.write(b"Black turn, waiting...")?;
-        }
-        if current_turn == Team::Black {
-            for player in team_black {
-                let tx_clone = tx.clone();
-                let tx_action = tx_action.clone();
-                thread::spawn(move || {
-                    turn(player, tx_clone, tx_action);
-                });
-            }
-            for _ in 0..black_length {
-                let (action, id) = rx_action.recv().unwrap();
-                if action == Action::Attack {
-                    let target = &mut team_red[id.unwrap() as usize];
-                    target.health -= 10;
-                    target.stream.write(
-                        format!("You took 10 damage! Health remaining: {}", target.health)
-                            .as_bytes(),
-                    )?;
-                }
-            }
-            team_black = Vec::new();
-            for _ in 0..black_length {
-                let response = rx.recv().unwrap();
-                team_black.push(response);
-            }
-            for player in &mut team_black {
-                player.stream.write(b"All done.")?;
-            }
-        } else {
-            let teams = team_turn(team_red, &tx, &rx, team_black);
-            team_red = teams.0;
-            team_black = teams.1;
-        }
-    }
-
-    Ok(())
+    update(&game);
 }
 
 fn team_turn(
-    mut initial_vector: Vec<Player>,
-    tx: &Sender<Player>,
-    rx: &Receiver<Player>,
-    mut opposing_vector: Vec<Player>,
-) -> (Vec<Player>, Vec<Player>) {
-    let length = initial_vector.len();
+    initial_map: HashMap<String, Player>,
+    opposing_map: HashMap<String, Player>,
+) -> (HashMap<String, Player>, HashMap<String, Player>) {
     let (tx_action, rx_action) = mpsc::channel();
-    for player in &mut opposing_vector {
-        player.stream.write(b"Enemy turn, waiting...").unwrap();
-    }
-    for player in initial_vector {
-        if player.health > 0 {
-            let tx_clone = tx.clone();
-            let tx_action = tx_action.clone();
-            thread::spawn(move || {
-                turn(player, tx_clone, tx_action);
-            });
-        }
-    }
-    for _ in 0..length {
-        let (action, id) = rx_action.recv().unwrap();
-        if action == Action::Attack {
-            let target = &mut opposing_vector[id.unwrap() as usize];
-            target.health -= 10;
-            target.stream.write(b"You took 10 damage!").unwrap();
-        }
-    }
-    initial_vector = Vec::new();
-    for _ in 0..length {
-        let response = rx.recv().unwrap();
-        initial_vector.push(response);
-    }
-    for player in &mut initial_vector {
-        player.stream.write(b"All done.").unwrap();
-    }
-    return (initial_vector, opposing_vector);
+    let mut opposing_map = opposing_map.clone();
+
+    let new_map: HashMap<String, Player> = initial_map
+        .into_iter()
+        .map(|pair| {
+            let (name, mut player) = pair;
+            if player.health > 0 {
+                let tx_action = tx_action.clone();
+                let player_clone = player.clone();
+                thread::spawn(move || {
+                    turn(player_clone, tx_action);
+                });
+            }
+
+            let (action, target) = rx_action.recv().unwrap();
+            if action == Action::Attack {
+                let target = target.unwrap();
+                if let Some(target) = opposing_map.get_mut(&target) {
+                    target.health -= 10;
+                    println!("Turn over")
+                } else {
+                    println!("That person doesn't exist!")
+                }
+            } else if action == Action::Heal {
+                player.health += 5;
+            }
+            (name, player)
+        })
+        .collect();
+    return (new_map, opposing_map);
 }
 
-fn turn(mut player: Player, player_tx: Sender<Player>, tx: Sender<(Action, Option<u8>)>) {
-    player.stream.set_nonblocking(false).unwrap();
-    player
-        .stream
-        .write(b"Attack [attack] or defend [defend]?")
-        .unwrap();
-    let mut buffer = [0; 1024];
-    player.stream.read(&mut buffer).unwrap();
-    if &buffer[0..6] == b"attack" {
-        player.stream.write(b"Who? [id]").unwrap();
-        let mut buffer = [0; 1];
-        player.stream.read(&mut buffer).unwrap();
-        let id = buffer[0] - 48;
-        println!("Here {}", id);
-        tx.send((Action::Attack, Some(id))).unwrap();
-    } else if &buffer[0..6] == b"defend" {
+fn turn(player: Player, tx: Sender<(Action, Option<String>)>) {
+    let stream = player.stream.lock().unwrap();
+    stream.set_nonblocking(false).unwrap();
+    drop(stream);
+    loop {
+        let mut stream = player.stream.lock().unwrap();
+        let mut buffer = [0; 1024];
+        stream.read(&mut buffer).unwrap();
+        if &buffer[0..6] == b"attack" {
+            let name = read_string(&mut stream);
+            tx.send((Action::Attack, Some(name))).unwrap();
+            break;
+        } else if &buffer[0..4] == b"heal" {
+            tx.send((Action::Heal, None)).unwrap();
+            break;
+        }
+        drop(stream);
+        thread::sleep(Duration::from_millis(30));
     }
-    thread::sleep(Duration::from_millis(30));
-    player_tx.send(player).unwrap();
 }
 
 fn single_connection(mut stream: TcpStream, tx: Sender<Player>, id: u8) {
     let team: Team;
     loop {
-        stream.write(b"team?").unwrap();
-        let mut buffer = [0; 5];
+        stream.write(b"team? \n").unwrap();
+        let mut buffer = [0; 1024];
+        println!("About to read team");
         stream.read(&mut buffer).unwrap();
-        if &buffer == b"black" {
+        if &buffer[0..5] == b"black" {
             team = Team::Black;
             break;
         } else if &buffer[0..3] == b"red" {
@@ -179,16 +193,21 @@ fn single_connection(mut stream: TcpStream, tx: Sender<Player>, id: u8) {
         }
         thread::sleep(Duration::from_millis(30));
     }
-    println!("Team: {:?}", team);
+
+    stream.write(b"name? (Max 1028 bytes) \n").unwrap();
+    let name = read_string(&mut stream);
+    println!("name {} ", name);
+
     loop {
-        stream.write(b"ready?").unwrap();
-        let mut buffer = [0; 5];
+        stream.write(b"ready? \n").unwrap();
+        let mut buffer = [0; 1024];
         stream.read(&mut buffer).unwrap();
         let stream = stream.try_clone().unwrap();
-        if &buffer == b"ready" {
+        if &buffer[0..5] == b"ready" {
             println!("ready!");
             tx.send(Player {
-                stream,
+                name: name.clone(),
+                stream: Arc::new(Mutex::new(stream)),
                 id,
                 health: 100,
                 ready: true,
@@ -198,7 +217,8 @@ fn single_connection(mut stream: TcpStream, tx: Sender<Player>, id: u8) {
             break;
         } else {
             tx.send(Player {
-                stream,
+                name: name.clone(),
+                stream: Arc::new(Mutex::new(stream)),
                 id,
                 health: 100,
                 ready: false,
@@ -208,6 +228,27 @@ fn single_connection(mut stream: TcpStream, tx: Sender<Player>, id: u8) {
         }
         thread::sleep(Duration::from_millis(30));
     }
-    stream.write(b"Waiting...").unwrap();
-    loop {}
+}
+
+fn read_string(stream: &mut TcpStream) -> std::string::String {
+    let mut buffer = [0; 1024];
+    let size = stream.read(&mut buffer).unwrap();
+    str::from_utf8(&buffer[0..size]).unwrap().to_string()
+}
+
+fn update(game: &GameState) {
+    let json = format!("{}\n", serde_json::to_string(game).unwrap());
+    println!("{}", json);
+    let json_bytes = json.as_bytes();
+    let team_black = game.team_black.clone();
+    let team_red = game.team_red.clone();
+    for (_name, player) in team_black {
+        let mut stream = player.stream.lock().unwrap();
+        stream.write(json_bytes).unwrap();
+    }
+
+    for (_name, player) in team_red {
+        let mut stream = player.stream.lock().unwrap();
+        stream.write(json_bytes).unwrap();
+    }
 }
